@@ -6,11 +6,11 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Outline
 import android.graphics.Rect
+import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
-import android.widget.RemoteViews
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -19,20 +19,28 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 
 class HookEntry : IXposedHookLoadPackage {
 
-    // OPPO/ColorOS 系统天气常见包名列表
-    private val WEATHER_PACKAGES = setOf(
-        "com.coloros.weather",
-        "com.coloros.weather2",
-        "com.heytap.weather",
-        "com.oppo.weather"
-    )
+    companion object {
+        private val WEATHER_PACKAGES = setOf(
+            "com.coloros.weather",
+            "com.coloros.weather2",
+            "com.heytap.weather",
+            "com.oppo.weather"
+        )
 
+        private const val PREFS_NAME = "zand_widget_anchor_prefs"
+        private const val KEY_RADIUS_PX = "anchor_radius_px"
+        private const val MIN_VIEW_SIZE_PX = 50
+        private const val MIN_RADIUS_PX = 1f
+    }
+
+    @Volatile
     private var prefs: SharedPreferences? = null
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // ColorOS/OPPO 启动器可能使用其他包名；需要按目标设备确认。
         if (lpparam.packageName != "com.android.launcher") return
 
-        // 1. 清除第三方小组件的默认系统 Padding（保留天气小组件自身原始结构作为锚点标尺）
+        // 保留系统返回值。第三方组件的默认 padding 可能是其布局的一部分。
         XposedHelpers.findAndHookMethod(
             AppWidgetHostView::class.java,
             "getDefaultPaddingForWidget",
@@ -41,41 +49,24 @@ class HookEntry : IXposedHookLoadPackage {
             Rect::class.java,
             object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    val cn = param.args[1] as? ComponentName
-                    if (cn != null && cn.packageName in WEATHER_PACKAGES) return
-                    param.result = Rect(0, 0, 0, 0)
+                    val component = param.args.getOrNull(1) as? ComponentName ?: return
+                    if (component.packageName !in WEATHER_PACKAGES) return
+
+                    val original = param.result as? Rect ?: return
+                    param.result = Rect(original)
                 }
             }
         )
 
-        XposedHelpers.findAndHookMethod(
-            View::class.java,
-            "setPadding",
-            Int::class.javaPrimitiveType,
-            Int::class.javaPrimitiveType,
-            Int::class.javaPrimitiveType,
-            Int::class.javaPrimitiveType,
-            object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val host = param.thisObject as? AppWidgetHostView ?: return
-                    if (isWeatherAnchor(host)) return
-                    param.args[0] = 0; param.args[1] = 0; param.args[2] = 0; param.args[3] = 0
-                }
-            }
-        )
-
-        // 2. 在 AppWidgetHostView 布局完成时，区分是“天气锚点”还是“第三方小组件”
-        val layoutHook = object : XC_MethodHook() {
+        val hook = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
-                val hostView = param.thisObject as? AppWidgetHostView ?: return
-                ensurePrefs(hostView.context)
-
-                if (isWeatherAnchor(hostView)) {
-                    // 发现系统天气小组件：提取它的真实视觉边界与圆角，写入永久缓存
-                    hostView.post { captureWeatherAnchor(hostView) }
+                val host = param.thisObject as? AppWidgetHostView ?: return
+                if (isWeatherAnchor(host)) {
+                    ensurePrefs(host.context)
+                    host.post { captureWeatherRadius(host) }
                 } else {
-                    // 第三方小组件：从缓存读取天气标准尺寸进行规范化
-                    applyWeatherStandard(hostView)
+                    ensurePrefs(host.context)
+                    host.post { applyWeatherRadiusIfKnown(host) }
                 }
             }
         }
@@ -88,172 +79,146 @@ class HookEntry : IXposedHookLoadPackage {
             Int::class.javaPrimitiveType,
             Int::class.javaPrimitiveType,
             Int::class.javaPrimitiveType,
-            layoutHook
+            hook
         )
 
         XposedHelpers.findAndHookMethod(
             AppWidgetHostView::class.java,
             "updateAppWidget",
-            RemoteViews::class.java,
-            layoutHook
+            android.widget.RemoteViews::class.java,
+            hook
         )
     }
 
-    private fun ensurePrefs(context: Context?) {
-        if (prefs == null && context != null) {
-            prefs = context.getSharedPreferences("zand_widget_anchor_prefs", Context.MODE_PRIVATE)
-        }
-    }
-
-    private fun isWeatherAnchor(hostView: AppWidgetHostView): Boolean {
-        val pkg = hostView.appWidgetInfo?.provider?.packageName ?: return false
-        return pkg in WEATHER_PACKAGES
-    }
-
-    /**
-     * 测量系统天气小组件的真实可视边界与圆角，并保存为全桌面通用标尺
-     */
-    private fun captureWeatherAnchor(weatherView: AppWidgetHostView) {
-        val cellW = weatherView.width
-        val cellH = weatherView.height
-        if (cellW <= 50 || cellH <= 50) return
-
-        // 寻找天气小组件内部真正绘制背景圆角的卡片视图
-        val cardView = findRoundedCardChild(weatherView) ?: weatherView
-        val actualW = cardView.width
-        val actualH = cardView.height
-        if (actualW <= 50 || actualH <= 50) return
-
-        // 提取圆角半径
-        var radius = extractOutlineRadius(cardView)
-        if (radius <= 5f) {
-            radius = dp2px(weatherView.context, 24f)
-        }
-
-        // 识别当前天气小组件属于哪种网格规格 (2x1, 2x2, 4x1, 4x2, 4x4)
-        val specKey = classifyGridSpec(weatherView.context, cellW, cellH)
-        val editor = prefs?.edit() ?: return
-
-        editor.putFloat("anchor_radius_px", radius)
-        editor.putInt("${specKey}_w", actualW)
-        editor.putInt("${specKey}_h", actualH)
-
-        // 记录单格基准尺寸，用于自动推算其他未摆放过的规格 (如 4x1, 4x2, 4x4)
-        val cols = if (specKey.startsWith("4")) 4 else 2
-        val rows = specKey.substringAfter("x").toIntOrNull() ?: 1
-        val singleColW = actualW / cols
-        val singleRowH = actualH / rows
-
-        // 推算并补全缺失的规格（仅当该规格未被实测覆盖时）
-        val allSpecs = listOf("2x1", "2x2", "4x1", "4x2", "4x4")
-        for (s in allSpecs) {
-            if (s == specKey) continue
-            val c = if (s.startsWith("4")) 4 else 2
-            val r = s.substringAfter("x").toIntOrNull() ?: 1
-            if (!prefs!!.contains("${s}_w")) {
-                // 4列宽度约为2列宽度的2倍加上中间列间距
-                val estW = if (c == cols) actualW else (actualW * c / cols)
-                val estH = if (r == rows) actualH else (actualH * r / rows)
-                editor.putInt("${s}_w", estW)
-                editor.putInt("${s}_h", estH)
+    private fun ensurePrefs(context: Context) {
+        if (prefs == null) {
+            synchronized(this) {
+                if (prefs == null) {
+                    prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                }
             }
         }
-        editor.apply()
+    }
 
-        XposedBridge.log("[WidgetAligner] 已采集天气锚点 [$specKey]: 实测宽=${actualW}px, 实测高=${actualH}px, 圆角=${radius}px")
+    private fun isWeatherAnchor(host: AppWidgetHostView): Boolean {
+        val packageName = host.appWidgetInfo?.provider?.packageName ?: return false
+        return packageName in WEATHER_PACKAGES
     }
 
     /**
-     * 将缓存的天气锚点尺寸应用到所有第三方小组件上
+     * 仅记录可以从 View Outline 或 GradientDrawable 可靠读到的圆角。
+     * View 的可见边界可能由图片、自绘 Canvas 或非矩形路径实现，
+     * 这些情况无法通过通用 View API 准确推断。
      */
-    private fun applyWeatherStandard(hostView: AppWidgetHostView) {
-        val context = hostView.context ?: return
-        val cellW = hostView.width
-        val cellH = hostView.height
-        if (cellW <= 0 || cellH <= 0) return
+    private fun captureWeatherRadius(weatherHost: AppWidgetHostView) {
+        if (weatherHost.width < MIN_VIEW_SIZE_PX || weatherHost.height < MIN_VIEW_SIZE_PX) return
 
-        val specKey = classifyGridSpec(context, cellW, cellH)
-        val p = prefs
+        val card = findRoundedCard(weatherHost) ?: return
+        val radius = extractRadiusPx(card) ?: return
+        if (radius < MIN_RADIUS_PX) return
 
-        val radiusPx = p?.getFloat("anchor_radius_px", -1f)?.takeIf { it > 5f }
-            ?: dp2px(context, 24f)
+        prefs?.edit()
+            ?.putFloat(KEY_RADIUS_PX, radius)
+            ?.apply()
 
-        val targetW = p?.getInt("${specKey}_w", -1)?.takeIf { it > 50 }
-            ?: (cellW - dp2px(context, 10f).toInt())
+        XposedBridge.log(
+            "[WidgetAligner] Captured weather radius=${radius}px " +
+                "view=${card.javaClass.name} size=${card.width}x${card.height}"
+        )
+    }
 
-        val targetH = p?.getInt("${specKey}_h", -1)?.takeIf { it > 50 }
-            ?: (cellH - dp2px(context, 18f).toInt())
+    /**
+     * 圆角只作用于可识别的第三方背景 View；不设置 HostView 的裁剪，
+     * 不改 HostView/子 View 的尺寸、padding、margin 或 translation。
+     */
+    private fun applyWeatherRadiusIfKnown(host: AppWidgetHostView) {
+        if (host.width < MIN_VIEW_SIZE_PX || host.height < MIN_VIEW_SIZE_PX) return
+        val radius = prefs?.getFloat(KEY_RADIUS_PX, -1f) ?: return
+        if (radius < MIN_RADIUS_PX) return
 
-        val left = ((cellW - targetW) / 2).coerceAtLeast(0)
-        val right = (left + targetW).coerceAtMost(cellW)
-        val top = 0
-        val bottom = targetH.coerceAtMost(cellH)
+        val card = findBackgroundCard(host) ?: return
 
-        hostView.translationY = 0f
-        hostView.outlineProvider = object : ViewOutlineProvider() {
+        // 保留原 Outline 行为，仅当该 View 原本有可识别圆角时才替换其半径。
+        val existingRadius = extractRadiusPx(card) ?: return
+        if (existingRadius < MIN_RADIUS_PX) return
+
+        card.outlineProvider = object : ViewOutlineProvider() {
             override fun getOutline(view: View, outline: Outline) {
-                outline.setRoundRect(left, top, right, bottom, radiusPx)
+                val rect = drawableBounds(view)
+                if (rect.width() <= 0 || rect.height() <= 0) {
+                    outline.setEmpty()
+                    return
+                }
+                outline.setRoundRect(rect, radius.coerceAtMost(
+                    minOf(rect.width(), rect.height()) / 2f
+                ))
             }
         }
-        hostView.clipToOutline = true
-
-        // 同步调整第三方小组件内部子视图的边距，保证内容完整居中不溢出
-        if (hostView.childCount > 0) {
-            val child = hostView.getChildAt(0)
-            val lp = child.layoutParams as? ViewGroup.MarginLayoutParams
-            val marginBottom = (cellH - bottom).coerceAtLeast(0)
-            if (lp != null && (lp.leftMargin != left || lp.rightMargin != left || lp.bottomMargin != marginBottom || lp.topMargin != 0)) {
-                lp.setMargins(left, 0, left, marginBottom)
-                child.layoutParams = lp
-            }
-        }
+        card.invalidateOutline()
     }
 
-    /**
-     * 根据小组件在桌面占据的像素宽高，判断其所属的网格规格 (2x1 / 2x2 / 4x1 / 4x2 / 4x4)
-     */
-    private fun classifyGridSpec(context: Context, w: Int, h: Int): String {
-        val screenW = context.resources.displayMetrics.widthPixels
-        val is4Col = w > screenW * 0.65f
-        val colStr = if (is4Col) "4" else "2"
-
-        val ratio = w.toFloat() / h.toFloat()
-        val rowStr = when {
-            is4Col && ratio > 2.8f -> "1"   // 4x1
-            is4Col && ratio > 1.4f -> "2"   // 4x2
-            is4Col -> "4"                   // 4x4
-            !is4Col && ratio > 1.35f -> "1" // 2x1
-            else -> "2"                     // 2x2
+    private fun findRoundedCard(root: View): View? {
+        if (root.width >= MIN_VIEW_SIZE_PX &&
+            root.height >= MIN_VIEW_SIZE_PX &&
+            extractRadiusPx(root) != null
+        ) {
+            return root
         }
-        return "${colStr}x${rowStr}"
-    }
 
-    private fun findRoundedCardChild(root: View): View? {
-        if (extractOutlineRadius(root) > 5f) return root
         if (root is ViewGroup) {
-            for (i in 0 until root.childCount) {
-                val found = findRoundedCardChild(root.getChildAt(i))
-                if (found != null) return found
+            for (index in 0 until root.childCount) {
+                findRoundedCard(root.getChildAt(index))?.let { return it }
             }
         }
         return null
     }
 
-    private fun extractOutlineRadius(view: View): Float {
+    private fun findBackgroundCard(root: View): View? {
+        if (root !== root.rootView &&
+            root.width >= MIN_VIEW_SIZE_PX &&
+            root.height >= MIN_VIEW_SIZE_PX &&
+            root.background != null &&
+            extractRadiusPx(root) != null
+        ) {
+            return root
+        }
+
+        if (root is ViewGroup) {
+            for (index in 0 until root.childCount) {
+                findBackgroundCard(root.getChildAt(index))?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun extractRadiusPx(view: View): Float? {
+        val background = view.background
+        if (background is GradientDrawable) {
+            val radii = background.cornerRadii
+            if (radii != null && radii.isNotEmpty()) {
+                val first = radii[0]
+                if (first > 0f) return first
+            }
+            val radius = background.cornerRadius
+            if (radius > 0f) return radius
+        }
+
         return try {
+            val provider = view.outlineProvider ?: return null
             val outline = Outline()
-            view.outlineProvider?.getOutline(view, outline)
-            outline.radius
+            provider.getOutline(view, outline)
+            if (outline.radius > 0f) outline.radius else null
         } catch (_: Throwable) {
-            -1f
+            null
         }
     }
 
-    private fun dp2px(context: Context, dp: Float): Float {
-        return TypedValue.applyDimension(
-            TypedValue.COMPLEX_UNIT_DIP,
-            dp,
-            context.resources.displayMetrics
-        )
+    private fun drawableBounds(view: View): Rect {
+        val bg = view.background ?: return Rect(0, 0, view.width, view.height)
+        val left = view.paddingLeft
+        val top = view.paddingTop
+        val right = (view.width - view.paddingRight).coerceAtLeast(left)
+        val bottom = (view.height - view.paddingBottom).coerceAtLeast(top)
+        return Rect(left, top, right, bottom)
     }
 }
